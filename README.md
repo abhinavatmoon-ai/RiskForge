@@ -1297,6 +1297,267 @@ Potential future iterations include:
 
 ---
 
+# 🧱 Build-From-Scratch Blueprint
+
+The earlier sections describe the architecture. This section is the implementation contract: service ownership, data contracts, failure rules, and the build order needed to recreate RiskForge from an empty repository.
+
+## Scope and boundaries
+
+RiskForge simulates a payment-risk platform. A client submits a transaction; the system records it, evaluates fraud risk asynchronously, then either settles it or creates an alert. It is a learning project, not a real payment processor.
+
+```text
+External client
+  -> API Gateway (only public service)
+  -> Ingestion Service (durable acceptance)
+  -> Kafka raw-transactions, key = accountId
+  -> Fraud Engine (risk decision)
+  -> settlement-approved OR flagged-fraud-events
+  -> Settlement Service OR Notification Service
+```
+
+- Only the gateway is public.
+- Each service owns its own database tables; no cross-service database access.
+- PostgreSQL is durable business state. Redis is temporary, low-latency state.
+- Kafka events are versioned integration contracts, not shared JPA entities.
+- `202 Accepted` means the transaction is recorded for processing; it does not mean it is approved or settled.
+
+## Service LLD and responsibilities
+
+| Service | Port | Owns | Inputs | Outputs |
+| --- | ---: | --- | --- | --- |
+| API Gateway | 8080 | authentication, routing, request limits | external REST | internal REST to ingestion |
+| Ingestion | 8081 | accepted transaction, idempotency, outbox | REST transaction request | `raw-transactions` |
+| Fraud Engine | 8082 | risk decision, rules, Redis velocity state | `raw-transactions` | approval or fraud event |
+| Settlement | 8083 | immutable ledger entries | `settlement-approved` | final `SETTLED` state/audit |
+| Notification | 8084 | alert delivery audit | `flagged-fraud-events` | mock webhook/SMS/email alert |
+
+### API Gateway
+
+```text
+request
+ -> AuthenticationFilter: validate HS256 JWT and expiry
+ -> remove client-supplied X-Auth-User-Id
+ -> add validated JWT subject as X-Auth-User-Id
+ -> Redis RequestRateLimiter
+ -> CircuitBreaker
+ -> ingestion-service:8081
+```
+
+It must not contain transaction validation, fraud scoring, database writes, or Kafka publishing. Initial public route: `POST /api/v1/transactions`; actuator health stays available at `/actuator/health`.
+
+### Ingestion Service
+
+```text
+TransactionController
+ -> request validation
+ -> IdempotencyService
+ -> application service
+    -> transactions table: PENDING
+    -> outbox_events table: raw-transactions payload
+ -> outbox publisher -> Kafka
+```
+
+Recommended package boundaries: `api` (controller/DTO/error handler), `application` (use cases), `domain` (transaction and state machine), and `infrastructure` (JPA, Kafka, outbox). Save the transaction and its outbox event in the same database transaction; a background publisher sends unpublished outbox rows after a crash.
+
+### Fraud Engine
+
+```text
+KafkaListener(raw-transactions, group=fraud-engine)
+ -> duplicate-event guard
+ -> Redis VelocityWindowService
+ -> RuleEngine
+ -> RiskScoreCalculator
+ -> risk_decisions audit table
+ -> settlement-approved OR flagged-fraud-events
+```
+
+Use `accountId` as the Kafka key. It preserves order for one account within a partition, not globally. Start with explainable rules: blacklist (+40), more than 3 transactions in 60 seconds (+30), high amount (+10), and location anomaly (+20). Clamp scores to `0..100`; score `>= 75` is `FLAGGED`, otherwise `APPROVED`. Persist each triggered rule and contribution.
+
+### Settlement Service
+
+```text
+KafkaListener(settlement-approved, group=settlement)
+ -> idempotency lookup
+ -> one PostgreSQL transaction
+    -> load/lock account state
+    -> create immutable ledger entry
+    -> mark transaction SETTLED
+    -> record processed event
+ -> commit
+```
+
+Enforce a unique `transaction_id` in the ledger or processed-event table. Kafka is at-least-once; a duplicate delivery must not apply money twice. Do not add automatic HTTP/Kafka retries to financial writes without this guard.
+
+### Notification Alert Service
+
+```text
+KafkaListener(flagged-fraud-events, group=notifications)
+ -> duplicate-event guard
+ -> alert audit record
+ -> NotificationProvider interface
+ -> log/mock webhook first; delivery retry and DLQ later
+```
+
+Notifications never alter a risk decision. A notification outage must not block fraud processing or settlement decisions.
+
+## API and event contracts
+
+### Transaction submission
+
+```http
+POST /api/v1/transactions
+Authorization: Bearer <JWT>
+Idempotency-Key: <UUID>
+Content-Type: application/json
+```
+
+```json
+{
+  "accountId": "ACC-10001",
+  "cardId": "CARD-90001",
+  "amount": 12500.00,
+  "currency": "INR",
+  "merchantId": "MERCHANT-100",
+  "latitude": 19.0760,
+  "longitude": 72.8777,
+  "timestamp": "2026-08-26T10:30:00Z"
+}
+```
+
+Validate nonblank/length-bounded IDs, a positive `BigDecimal` amount, ISO-4217 currency, UTC timestamp, valid coordinate ranges, and a required idempotency key. Repeat of the same key returns the original `202` result instead of creating another transaction.
+
+```json
+{
+  "transactionId": "txn-uuid",
+  "status": "PENDING",
+  "receivedAt": "2026-08-26T10:30:01Z"
+}
+```
+
+### Kafka event envelope
+
+Start with JSON and version every event. Later adopt Avro/Protobuf plus a schema registry.
+
+```json
+{
+  "eventId": "evt-uuid",
+  "eventType": "riskforge.transaction.received.v1",
+  "occurredAt": "2026-08-26T10:30:01Z",
+  "correlationId": "txn-uuid",
+  "producer": "ingestion-service",
+  "payload": {}
+}
+```
+
+| Topic | Producer | Consumer | Key | Required payload |
+| --- | --- | --- | --- | --- |
+| `raw-transactions` | ingestion | fraud engine | `accountId` | transaction ID, payment data, timestamps |
+| `settlement-approved` | fraud engine | settlement | `accountId` | transaction ID, risk score, decision |
+| `flagged-fraud-events` | fraud engine | notifications | `accountId` | transaction ID, score, triggered rules |
+| `<topic>.dlq` | retry/error handler | operators | original key | original event plus error metadata |
+
+Never remove or rename a field used by consumers in an event version. Add optional fields or publish `v2`.
+
+## Data model and state machine
+
+| Owner | Table | Minimum columns | Constraint |
+| --- | --- | --- | --- |
+| Ingestion | `transactions` | `id`, `account_id`, `amount`, `currency`, `status`, `received_at` | PK `id`; index `(account_id, received_at)` |
+| Ingestion | `idempotency_keys` | `key`, `request_hash`, `transaction_id` | unique `key` |
+| Ingestion | `outbox_events` | `id`, `aggregate_id`, `topic`, `payload`, `published_at` | index unpublished rows |
+| Fraud | `risk_decisions`, `processed_events`, `blacklist_entries` | decision/rule/audit data | unique transaction/event ID |
+| Settlement | `ledger_entries`, `processed_events` | transaction, account, amount, timestamp | unique transaction ID |
+| Notification | `alerts` | transaction, channel, status, attempts | unique transaction/channel |
+
+```text
+PENDING -> APPROVED -> SETTLED
+PENDING -> FLAGGED -> BLOCKED -> ALERTED
+```
+
+Define legal state transitions centrally. A `BLOCKED` transaction can never be settled. Ledger rows are immutable; corrections use compensating entries, never an update to historical money movement.
+
+## Redis velocity algorithm
+
+Use `velocity:account:<accountId>` as a sorted set. Use the transaction ID as member so two requests in the same millisecond do not overwrite one another.
+
+```text
+windowStart = now - 60 seconds
+ZREMRANGEBYSCORE key 0 windowStart
+ZADD key now transactionId
+count = ZCARD key
+EXPIRE key 120
+if count > 3: trigger velocity rule
+```
+
+Make the sequence atomic with Lua or a Redis transaction/pipeline before handling concurrent production traffic. For the first version, use ingestion time consistently; later explicitly model late/out-of-order event policy.
+
+## Reliability rules
+
+| Failure | Required response |
+| --- | --- |
+| HTTP retry | idempotency key returns the original transaction |
+| DB commit then process crash | unpublished outbox record is published after restart |
+| Kafka duplicate | unique event/transaction guard makes consumer safe |
+| Fraud engine down | Kafka retains raw events; never auto-approve |
+| Redis down | choose/document a policy; starter recommendation is fail closed and audit |
+| Settlement down | approved events remain in Kafka |
+| Notification down | retry separately; decision remains final |
+| Poison event | bounded retries then DLQ with failure metadata |
+
+All services should assume at-least-once delivery. Idempotent state changes, not wishful exactly-once assumptions, provide correctness.
+
+## Dependency-ordered implementation plan
+
+1. **Foundation:** Maven parent/modules, Docker Compose, Kafka, PostgreSQL, Redis, migrations, topic creation, health checks, `.env.example`.
+2. **Gateway and ingestion:** JWT/routing/rate limit, request validation, `PENDING` persistence, idempotency, transactional outbox, `raw-transactions` publication.
+3. **Fraud engine:** consumer, duplicate guard, Redis velocity window, blacklist/rule scoring, decision persistence, two output topics.
+4. **Settlement and notification:** idempotent ledger write, mock alert provider, retry/DLQ.
+5. **Operations:** Actuator, Micrometer, Prometheus/Grafana, structured correlation IDs, Testcontainers, Docker images, CI, then Kubernetes.
+
+Definition of done for each phase:
+
+```text
+Gateway + ingestion: one request -> one PENDING row -> one Kafka event;
+same Idempotency-Key -> no duplicate row/event.
+
+Fraud: deterministic test data -> one explainable score -> exactly one output event.
+
+Settlement: duplicate approved event -> exactly one ledger entry.
+
+Notification: flagged event -> alert audit entry; provider outage -> retry/DLQ, not blocked processing.
+```
+
+## Local build and verification checklist
+
+```text
+1. Start Kafka, PostgreSQL and Redis with Docker Compose.
+2. Run each service's database migration.
+3. Start: ingestion -> fraud -> settlement -> notification -> gateway.
+4. Submit through gateway with JWT and Idempotency-Key.
+5. Inspect transaction/outbox rows, Kafka records, Redis velocity key, risk decision, ledger or alert rows.
+6. Repeat the request with the same key.
+7. Stop one consumer and verify retained Kafka work is processed after restart.
+```
+
+Minimum test suite: JUnit/Mockito for rules and transitions; Testcontainers for PostgreSQL, Kafka, and Redis; an end-to-end test for both approved and flagged paths; duplicate-event, idempotency, outage-recovery, and basic concurrent-velocity scenarios.
+
+## Standard environment variables
+
+```text
+SPRING_PROFILES_ACTIVE=local
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DATABASE=<per-service database>
+POSTGRES_USER=riskforge
+POSTGRES_PASSWORD=<secret>
+REDIS_HOST=localhost
+REDIS_PORT=6379
+JWT_SECRET=<secret>
+```
+
+Commit `.env.example` only. Keep real credentials out of Git and use environment variables, Docker/Kubernetes secrets, and key rotation in later deployment phases.
+
 # 📚 Learning Objectives
 
 By completing RiskForge, the project should provide practical experience with:
