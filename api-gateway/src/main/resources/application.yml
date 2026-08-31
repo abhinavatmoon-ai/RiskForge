@@ -1,0 +1,38 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: ingestion-service-route
+          uri: http://localhost:8081
+          predicates:
+            - Path=/api/v1/transactions/**
+          filters:
+            - AuthenticationFilter
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@ipKeyResolver}"
+            - name: CircuitBreaker
+              args:
+                name: ingestionService
+                fallbackUri: forward:/fallback/ingestion
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+jwt:
+  # Set JWT_SECRET outside source control for real environments.
+  secret: ${JWT_SECRET:development-only-secret-change-this-to-at-least-32-bytes}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
