@@ -9,6 +9,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 @RestControllerAdvice
 class ApiExceptionHandler {
+
+    // Global exception handler
     @ExceptionHandler(MethodArgumentNotValidException.class)
     ResponseEntity<Map<String, Object>> validationError(MethodArgumentNotValidException exception) {
         Map<String, String> fields = exception.getBindingResult().getFieldErrors().stream().collect(java.util.stream.Collectors.toMap(
