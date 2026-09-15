@@ -1,0 +1,28 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: ingestion-service
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DATABASE:homelab_db}
+    username: ${POSTGRES_USER:homelab}
+    password: ${POSTGRES_PASSWORD:homelab_password}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+riskforge:
+  kafka:
+    raw-transactions-topic: raw-transactions
+  outbox:
+    publish-delay-ms: 1000
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
